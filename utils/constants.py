@@ -1,0 +1,30 @@
+# constants.py
+
+RUSSIAN_HOLIDAYS = [
+    {"name": "Новый год", "date": "01-01", 'float_date': False},
+    {"name": "Канун Нового года", "date": "31-12", 'float_date': False},
+    {"name": "Рождество Христово (православное)", "date": "07-01", 'float_date': False},
+    {"name": "Старый Новый год", "date": "14-01", 'float_date': False},
+    {"name": "Татьянин день (День студента)", "date": "25-01", 'float_date': False},
+    {"name": "День защитника Отечества", "date": "23-02", 'float_date': False},
+    {"name": "День Святого Валентина", "date": "14-02", 'float_date': False},
+    {"name": "Международный женский день", "date": "08-03", 'float_date': False},
+    {"name": "Праздник весны и труда", "date": "01-05", 'float_date': False},
+    {"name": "День Победы", "date": "09-05", 'float_date': False},
+    {"name": "День России", "date": "12-06", 'float_date': False},
+    {"name": "День ВДВ", "date": "02-08", 'float_date': False},
+    {"name": "День знаний", "date": "01-09", 'float_date': False},
+    {"name": "День программиста", "date": "256-й день года (13-09 или 12-09)", 'float_date': True},
+    {"name": "День учителя", "date": "05-10", 'float_date': False},
+    {"name": "День народного единства", "date": "04-11", 'float_date': False},
+    {"name": "День военного разведчика", "date": "05-11", 'float_date': False},
+    {"name": "День Конституции РФ", "date": "12-12", 'float_date': False},
+    {"name": "День матери", "date": "последнее воскресенье ноября", 'float_date': True},
+    {"name": "Масленица", "date": "плавающая (февраль/март, за 7 недель до Пасхи)", 'float_date': True},
+    {"name": "Пасха (православная)", "date": "плавающая (март/апрель)", 'float_date': True},
+    {"name": "Радоница", "date": "вторник после Пасхи", 'float_date': True},
+    {"name": "Троица (Пятидесятница)", "date": "на 50-й день после Пасхи", 'float_date': True},
+    {"name": "День ПВО", "date": "второе воскресенье апреля", 'float_date': True},
+    {"name": "Хэллоуин", "date": "31-10", 'float_date': False},
+    {"name": "День арбуза", "date": "03-08", 'float_date': False}
+]
