@@ -2,6 +2,7 @@ import os
 import logging
 import random
 from datetime import datetime, timedelta
+from typing import Optional
 import requests
 from telegram import ReactionTypeEmoji, Update
 from telegram.ext import ContextTypes
@@ -17,8 +18,9 @@ class Messenger:
 
     def __init__(self):
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
+        self.system_prompt_override = None
 
-    def _build_system_prompt(self, bot_username: str) -> str:
+    def _default_system_prompt(self, bot_username: str) -> str:
         return f"""\
 НИКОГДА НЕ ИСПОЛЬЗУЙ MARKDOWN РАЗМЕТКУ В ОТВЕТАХ!
 
@@ -35,13 +37,21 @@ class Messenger:
 ЕЩЕ РАЗ, НИКОГДА НЕ ИСПОЛЬЗУЙ MARKDOWN РАЗМЕТКУ В ОТВЕТАХ!
 """
 
+    def set_system_prompt(self, new_prompt: Optional[str]) -> None:
+        self.system_prompt_override = new_prompt
+
+    def get_current_system_prompt(self, bot_username: str) -> str:
+        if self.system_prompt_override and self.system_prompt_override.strip():
+            return self.system_prompt_override
+        return self._default_system_prompt(bot_username)
+
     def _call_deepseek(self, messages, bot_username: str) -> str:
         url = "https://api.deepseek.com/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        system_prompt = self._build_system_prompt(bot_username)
+        system_prompt = self.get_current_system_prompt(bot_username)
         data = {
             "model": "deepseek-chat",
             "messages": [{"role": "system", "content": system_prompt}] + messages,
@@ -51,6 +61,9 @@ class Messenger:
         return response.json()["choices"][0]["message"]["content"]
 
     async def _maybe_add_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        reactions_enabled = context.chat_data.get("reactions_enabled", True)
+        if not reactions_enabled:
+            return
         if random.random() > 0.05:
             return
         text = update.message.text.lower()
@@ -79,13 +92,34 @@ class Messenger:
         username = user.username or "unknown"
         logging.info(f"[INCOMING] From {username} (ID: {user.id}): {user_text}")
         context.chat_data["last_message_time"] = datetime.utcnow()
-        if "background_job" not in context.chat_data:
-            context.chat_data["background_job"] = context.job_queue.run_repeating(
-                self.check_scheduled,
-                interval=3600,
-                first=3600,
-                chat_id=update.effective_chat.id,
-            )
+        # Respect mute window
+        muted_until = context.chat_data.get("muted_until")
+        if muted_until:
+            try:
+                if datetime.utcnow() < muted_until:
+                    return
+            except Exception:
+                pass
+        # Mention-based help: '@bot помощь' / '@bot команды'
+        try:
+            bot_username = context.bot_data.get("bot_username", "").lower()
+            lower_text = user_text.lower()
+            if bot_username and (f"@{bot_username}" in lower_text):
+                if any(k in lower_text for k in ["помощь", "команды", "help", "команда"]):
+                    await context.bot_data["commands"].handle_mention_help(update, context)
+                    return
+        except Exception:
+            logging.exception("Mention help handling failed")
+        # Lazy-init background job (enabled by default unless disabled explicitly)
+        if context.chat_data.get("autopost_enabled", True):
+            interval = context.chat_data.get("autopost_interval", 3600)
+            if "background_job" not in context.chat_data:
+                context.chat_data["background_job"] = context.job_queue.run_repeating(
+                    self.check_scheduled,
+                    interval=interval,
+                    first=interval,
+                    chat_id=update.effective_chat.id,
+                )
         scorer = Scorer(context.chat_data, context.bot_data["bot_username"], context.bot.id)
         decision = scorer.evaluate(update)
         await self._maybe_add_reaction(update, context)
@@ -94,6 +128,7 @@ class Messenger:
         mode = decision["mode"]
         bot_username = context.bot_data["bot_username"]
         history = context.chat_data.setdefault("history", [])
+        history_limit = context.chat_data.get("history_limit", self.MAX_HISTORY)
 
         async def reply_with_deepseek():
             try:
@@ -106,8 +141,8 @@ class Messenger:
             await msg.reply_text(reply)
             logging.info(f"[REPLY] To {username}: {reply}")
             history.append({"role": "assistant", "content": reply})
-            if len(history) > self.MAX_HISTORY:
-                history[:] = history[-self.MAX_HISTORY:]
+            if len(history) > history_limit:
+                history[:] = history[-history_limit:]
 
         if mode == "laughter":
             reply = random.choice([
@@ -122,8 +157,8 @@ class Messenger:
             return
         elif mode == "immediate":
             history.append({"role": "user", "content": user_text})
-            if len(history) > self.MAX_HISTORY:
-                history[:] = history[-self.MAX_HISTORY:]
+            if len(history) > history_limit:
+                history[:] = history[-history_limit:]
             await reply_with_deepseek()
             return
         elif mode == "delayed":
@@ -131,8 +166,8 @@ class Messenger:
 
             async def delayed_reply(context: ContextTypes.DEFAULT_TYPE):
                 history.append({"role": "user", "content": user_text})
-                if len(history) > self.MAX_HISTORY:
-                    history[:] = history[-self.MAX_HISTORY:]
+                if len(history) > history_limit:
+                    history[:] = history[-history_limit:]
                 await reply_with_deepseek()
 
             context.job_queue.run_once(delayed_reply, delay)
@@ -141,13 +176,18 @@ class Messenger:
 
     async def send_self_message(self, context: ContextTypes.DEFAULT_TYPE):
         now = datetime.utcnow()
+        # Do not send autoposts when muted
+        muted_until = context.chat_data.get("muted_until")
+        if muted_until and now < muted_until:
+            return
         last = context.chat_data.get("last_message_time")
-        if last and now - last <= timedelta(days=2):
+        if last and now - last <= timedelta(days=1):
             return
         bot_username = context.bot_data["bot_username"]
         history = context.chat_data.setdefault("history", [])
+        history_limit = context.chat_data.get("history_limit", self.MAX_HISTORY)
         content_type = random.choice(["шутку", "анекдот", "ситуацию"])
-        system_prompt = self._build_system_prompt(bot_username)
+        system_prompt = self.get_current_system_prompt(bot_username)
         topic_prompt = (
             f"Придумай ОДНУ тему на которую можно сделать {content_type}, учитывая роль которую отыгрывает бот: {system_prompt}"
         )
@@ -176,8 +216,8 @@ class Messenger:
             return
         await context.bot.send_message(chat_id=context.job.chat_id, text=reply)
         history.append({"role": "assistant", "content": reply})
-        if len(history) > self.MAX_HISTORY:
-            history[:] = history[-self.MAX_HISTORY:]
+        if len(history) > history_limit:
+            history[:] = history[-history_limit:]
         context.chat_data["last_message_time"] = now
         logging.info(f"[SELF MESSAGE] {reply}")
 
@@ -190,6 +230,7 @@ class Messenger:
             return
         bot_username = context.bot_data["bot_username"]
         history = context.chat_data.setdefault("history", [])
+        history_limit = context.chat_data.get("history_limit", self.MAX_HISTORY)
         holiday_names = ", ".join(holidays)
         prompt = (
             f"Сегодня {today.strftime('%d.%m.%Y')} {holiday_names}. Поздравь чат от своего имени, сохраняя стиль."
@@ -204,8 +245,8 @@ class Messenger:
             return
         await context.bot.send_message(chat_id=context.job.chat_id, text=reply)
         history.append({"role": "assistant", "content": reply})
-        if len(history) > self.MAX_HISTORY:
-            history[:] = history[-self.MAX_HISTORY:]
+        if len(history) > history_limit:
+            history[:] = history[-history_limit:]
         context.chat_data["holiday_sent_date"] = today
         context.chat_data["last_message_time"] = datetime.utcnow()
         logging.info(f"[HOLIDAY MESSAGE] {reply}")
