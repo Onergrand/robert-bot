@@ -12,6 +12,7 @@ from telegram.ext import (
 
 from message import Messenger
 from bot_commands import BotCommands
+from db.db import healthcheck  # NEW
 
 # Загрузка переменных из .env
 load_dotenv()
@@ -34,15 +35,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def post_init(application):
+    # Пишем имя бота в bot_data
     bot = await application.bot.get_me()
     application.bot_data["bot_username"] = bot.username
+
+    # Создаём единый Messenger и BotCommands
     messenger = Messenger()
     application.bot_data["messenger"] = messenger
     application.bot_data["commands"] = BotCommands(messenger)
     logging.info(f"Bot username: {bot.username}")
 
+    # Проверяем подключение к БД при старте
+    try:
+        await healthcheck()
+        logging.info("DB connection OK")
+    except Exception:
+        logging.exception("DB connection failed")
+        # Можно падать сразу:
+        # raise
 
-# Wrapper callbacks that delegate to BotCommands stored in bot_data
+
+# Обёртки, чтобы дергать методы BotCommands из bot_data
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot_data["commands"].help(update, context)
 
@@ -98,6 +111,15 @@ async def cmd_send_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_holiday_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot_data["commands"].holiday_check(update, context)
 
+async def cmd_clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot_data["commands"].clear_history(update, context)
+
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot_data["commands"].mute(update, context)
+
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot_data["commands"].unmute(update, context)
+
 
 def main():
     if not TELEGRAM_TOKEN:
@@ -120,9 +142,9 @@ def main():
     application.add_handler(CommandHandler("metrics", cmd_metrics))
     application.add_handler(CommandHandler("send_test", cmd_send_test))
     application.add_handler(CommandHandler("holiday_check", cmd_holiday_check))
-    application.add_handler(CommandHandler("clear_history", lambda u, c: c.bot_data["commands"].clear_history(u, c)))
-    application.add_handler(CommandHandler("mute", lambda u, c: c.bot_data["commands"].mute(u, c)))
-    application.add_handler(CommandHandler("unmute", lambda u, c: c.bot_data["commands"].unmute(u, c)))
+    application.add_handler(CommandHandler("clear_history", cmd_clear_history))
+    application.add_handler(CommandHandler("mute", cmd_mute))
+    application.add_handler(CommandHandler("unmute", cmd_unmute))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logging.info("Бот запущен...")

@@ -2,13 +2,21 @@ import os
 import logging
 import random
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Dict
 import requests
 from telegram import ReactionTypeEmoji, Update
 from telegram.ext import ContextTypes
 
 from scoring import Scorer
 from holiday_evaluator import HolidayEvaluator
+
+# NEW: работа с БД
+from db.chat_repo import (
+    ensure_chat, load_chat_config, save_chat_config,
+    load_history, append_message, clear_history,
+    was_holiday_sent_today, mark_holiday_sent,
+    load_metrics, save_metrics
+)
 
 
 class Messenger:
@@ -91,6 +99,22 @@ class Messenger:
         user_text = msg.text or ""
         username = user.username or "unknown"
         logging.info(f"[INCOMING] From {username} (ID: {user.id}): {user_text}")
+
+        # === БД: убедимся, что чат есть в таблице и подтащим конфиг/историю ===
+        chat = update.effective_chat
+        await ensure_chat(chat.id, chat.type, getattr(chat, 'title', None))
+
+        cfg = await load_chat_config(chat.id) or {}
+        history_limit = int(cfg.get("history_limit", self.MAX_HISTORY))
+        # Синхронизируем флаги из БД в chat_data (кэш для текущей сессии)
+        for k in ("autopost_enabled", "autopost_interval", "reactions_enabled", "muted_until"):
+            if k in cfg and cfg[k] is not None:
+                context.chat_data[k] = cfg[k]
+
+        # История для промпта (берём из БД)
+        history: List[Dict[str, str]] = await load_history(chat.id, history_limit)
+        context.chat_data["history"] = history  # кэш для scoring и т.п.
+
         context.chat_data["last_message_time"] = datetime.utcnow()
         # Respect mute window
         muted_until = context.chat_data.get("muted_until")
@@ -100,6 +124,7 @@ class Messenger:
                     return
             except Exception:
                 pass
+
         # Mention-based help: '@bot помощь' / '@bot команды'
         try:
             bot_username = context.bot_data.get("bot_username", "").lower()
@@ -110,6 +135,7 @@ class Messenger:
                     return
         except Exception:
             logging.exception("Mention help handling failed")
+
         # Lazy-init background job (enabled by default unless disabled explicitly)
         if context.chat_data.get("autopost_enabled", True):
             interval = context.chat_data.get("autopost_interval", 3600)
@@ -118,21 +144,24 @@ class Messenger:
                     self.check_scheduled,
                     interval=interval,
                     first=interval,
-                    chat_id=update.effective_chat.id,
+                    chat_id=chat.id,
                 )
+
+        # === Scoring/решение отвечать ===
         scorer = Scorer(context.chat_data, context.bot_data["bot_username"], context.bot.id)
         decision = scorer.evaluate(update)
+
         await self._maybe_add_reaction(update, context)
         if not decision.get("respond"):
+            # Можно по желанию синкать метрики в БД раз в N сообщений
             return
+
         mode = decision["mode"]
         bot_username = context.bot_data["bot_username"]
-        history = context.chat_data.setdefault("history", [])
-        history_limit = context.chat_data.get("history_limit", self.MAX_HISTORY)
 
-        async def reply_with_deepseek():
+        async def reply_with_deepseek(messages_for_llm):
             try:
-                reply = self._call_deepseek(history, bot_username).strip()
+                reply = self._call_deepseek(messages_for_llm, bot_username).strip()
             except Exception:
                 logging.exception("DeepSeek API failed")
                 reply = "Бля в мозгу ошибка"
@@ -140,9 +169,10 @@ class Messenger:
                 return
             await msg.reply_text(reply)
             logging.info(f"[REPLY] To {username}: {reply}")
-            history.append({"role": "assistant", "content": reply})
-            if len(history) > history_limit:
-                history[:] = history[-history_limit:]
+            # Сохраняем ответ ассистента
+            await append_message(chat.id, "assistant", reply, history_limit)
+            # Обновим кэш истории в памяти (не обязательно)
+            context.chat_data["history"] = await load_history(chat.id, history_limit)
 
         if mode == "laughter":
             reply = random.choice([
@@ -154,38 +184,54 @@ class Messenger:
                 "смешно бля",
             ])
             await msg.reply_text(reply)
+            # Лог в БД как ответ ассистента
+            await append_message(chat.id, "assistant", reply, history_limit)
+            context.chat_data["history"] = await load_history(chat.id, history_limit)
             return
+
         elif mode == "immediate":
-            history.append({"role": "user", "content": user_text})
-            if len(history) > history_limit:
-                history[:] = history[-history_limit:]
-            await reply_with_deepseek()
+            # Добавим сообщение пользователя в историю (БД)
+            await append_message(chat.id, "user", user_text, history_limit)
+            # Собираем историю для LLM (можно просто снова загрузить)
+            history = await load_history(chat.id, history_limit)
+            await reply_with_deepseek(history)
+            # Сохраним метрики
+            await save_metrics(chat.id, context.chat_data.get("scoring", {}))
             return
+
         elif mode == "delayed":
-            delay = decision.get("delay", 60)
+            delay = int(decision.get("delay", 60))
 
-            async def delayed_reply(context: ContextTypes.DEFAULT_TYPE):
-                history.append({"role": "user", "content": user_text})
-                if len(history) > history_limit:
-                    history[:] = history[-history_limit:]
-                await reply_with_deepseek()
+            async def delayed_reply(ctx: ContextTypes.DEFAULT_TYPE):
+                await append_message(chat.id, "user", user_text, history_limit)
+                hist = await load_history(chat.id, history_limit)
+                await reply_with_deepseek(hist)
+                await save_metrics(chat.id, ctx.chat_data.get("scoring", {}))
 
-            context.job_queue.run_once(delayed_reply, delay)
+            context.job_queue.run_once(delayed_reply, delay, chat_id=chat.id)
             logging.info(f"[DELAYED] Scheduled reply in {delay} seconds")
             return
 
     async def send_self_message(self, context: ContextTypes.DEFAULT_TYPE):
         now = datetime.utcnow()
+        chat_id = context.job.chat_id
+
+        # Подтянем актуальные настройки
+        cfg = await load_chat_config(chat_id) or {}
+        muted_until = cfg.get("muted_until")
+        history_limit = int(cfg.get("history_limit", self.MAX_HISTORY))
+
         # Do not send autoposts when muted
-        muted_until = context.chat_data.get("muted_until")
         if muted_until and now < muted_until:
             return
+
+        # Уважим «активность в последние сутки»
         last = context.chat_data.get("last_message_time")
         if last and now - last <= timedelta(days=1):
             return
+
         bot_username = context.bot_data["bot_username"]
-        history = context.chat_data.setdefault("history", [])
-        history_limit = context.chat_data.get("history_limit", self.MAX_HISTORY)
+        history = await load_history(chat_id, history_limit)
         content_type = random.choice(["шутку", "анекдот", "ситуацию"])
         system_prompt = self.get_current_system_prompt(bot_username)
         topic_prompt = (
@@ -195,13 +241,16 @@ class Messenger:
             holidays = HolidayEvaluator().evaluate()
             holiday_str = f" Праздник сегодня: {', '.join(holidays)}." if holidays else ""
             topic_prompt += f" Время и дата: {now.strftime('%d.%m.%Y %H:%M')}.{holiday_str}"
+
         try:
             topic = self._call_deepseek([{"role": "user", "content": topic_prompt}], bot_username).strip()
         except Exception:
-            logging.exception("DeepSeek API failed")
+            logging.exception("DeepSeek API failed (topic)")
             return
+
         if not topic or topic.endswith("NO_RESPONSE"):
             return
+
         prompt = (
             f"Сейчас {now.strftime('%d.%m.%Y %H:%M')}. Напиши {content_type} в чат без обращения к кому-то конкретно, будь в своей роли."
             f" Тема: {topic}"
@@ -210,44 +259,47 @@ class Messenger:
         try:
             reply = self._call_deepseek(messages, bot_username).strip()
         except Exception:
-            logging.exception("DeepSeek API failed")
+            logging.exception("DeepSeek API failed (autopost)")
             return
         if not reply or reply.endswith("NO_RESPONSE"):
             return
-        await context.bot.send_message(chat_id=context.job.chat_id, text=reply)
-        history.append({"role": "assistant", "content": reply})
-        if len(history) > history_limit:
-            history[:] = history[-history_limit:]
+
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+        await append_message(chat_id, "assistant", reply, history_limit)
         context.chat_data["last_message_time"] = now
         logging.info(f"[SELF MESSAGE] {reply}")
 
     async def send_holiday_congrats(self, context: ContextTypes.DEFAULT_TYPE):
         today = datetime.utcnow().date()
-        if context.chat_data.get("holiday_sent_date") == today:
+        chat_id = context.job.chat_id
+
+        # Уже отправляли сегодня?
+        if await was_holiday_sent_today(chat_id, today):
             return
+
         holidays = HolidayEvaluator().evaluate()
         if not holidays:
             return
+
         bot_username = context.bot_data["bot_username"]
-        history = context.chat_data.setdefault("history", [])
-        history_limit = context.chat_data.get("history_limit", self.MAX_HISTORY)
+        history_limit = int((await load_chat_config(chat_id) or {}).get("history_limit", self.MAX_HISTORY))
+        history = await load_history(chat_id, history_limit)
+
         holiday_names = ", ".join(holidays)
-        prompt = (
-            f"Сегодня {today.strftime('%d.%m.%Y')} {holiday_names}. Поздравь чат от своего имени, сохраняя стиль."
-        )
+        prompt = f"Сегодня {today.strftime('%d.%m.%Y')} {holiday_names}. Поздравь чат от своего имени, сохраняя стиль."
+
         messages = history + [{"role": "user", "content": prompt}]
         try:
             reply = self._call_deepseek(messages, bot_username).strip()
         except Exception:
-            logging.exception("DeepSeek API failed")
+            logging.exception("DeepSeek API failed (holiday)")
             return
         if not reply or reply.endswith("NO_RESPONSE"):
             return
-        await context.bot.send_message(chat_id=context.job.chat_id, text=reply)
-        history.append({"role": "assistant", "content": reply})
-        if len(history) > history_limit:
-            history[:] = history[-history_limit:]
-        context.chat_data["holiday_sent_date"] = today
+
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+        await append_message(chat_id, "assistant", reply, history_limit)
+        await mark_holiday_sent(chat_id, today)
         context.chat_data["last_message_time"] = datetime.utcnow()
         logging.info(f"[HOLIDAY MESSAGE] {reply}")
 

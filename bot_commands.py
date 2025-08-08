@@ -1,22 +1,23 @@
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from holiday_evaluator import HolidayEvaluator
 
+# NEW: БД-репозиторий
+from db.chat_repo import (
+    load_chat_config, save_chat_config,
+    clear_history, load_history
+)
+
 
 class BotCommands:
-    """Implements bot management commands as a separate class.
-
-    Stores and updates runtime settings in chat_data / bot_data so they are
-    accessible from other parts of the bot (e.g., Messenger).
-    """
+    """Команды управления ботом, теперь с сохранением настроек в БД."""
 
     def __init__(self, messenger):
-        # Messenger instance is created in post_init and passed here
+        # Messenger instance создаётся в post_init и пробрасывается сюда
         self.messenger = messenger
 
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -26,49 +27,64 @@ class BotCommands:
             "/set_prompt <текст> — изменить системный промпт (характер бота).\n"
             "/get_prompt — показать текущий системный промпт.\n"
             "/reset_prompt — сбросить промпт к значению по умолчанию.\n"
-            "/set_history_limit <число> — установить лимит хранимых сообщений (сейчас 50).\n"
-            "/set_autopost_interval <сек> — интервал автосообщений (сейчас 3600).\n"
+            "/set_history_limit <число> — установить лимит хранимых сообщений.\n"
+            "/set_autopost_interval <сек> — интервал автосообщений.\n"
             "/enable_autopost — включить автосообщения.\n"
             "/disable_autopost — выключить автосообщения.\n"
-            "/enable_reactions — включить автоматические реакции на сообщения.\n"
+            "/enable_reactions — включить автоматические реакции.\n"
             "/disable_reactions — выключить реакции.\n"
             "/status — текущее состояние бота.\n"
             "/metrics — показать счётчики.\n"
             "/send_test <текст> — отправить тест к DeepSeek и показать ответ.\n"
             "/holiday_check — проверить праздники на сегодня и что ответит бот.\n"
             "/clear_history — очистить историю сообщений.\n"
-            "/mute <минуты> — замьютить бота на указанное время.\n"
-            "/unmute — снять мьют бота.\n"
-            "\nТакже можно написать '@имя_бота помощь' или '@имя_бота команды'."
+            "/mute <минуты> — замьютить на указанное время.\n"
+            "/unmute — снять мьют."
         )
         await update.message.reply_text(text)
 
     async def set_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
         new_prompt = " ".join(context.args).strip()
         if not new_prompt:
             await update.message.reply_text("Укажите текст промпта: /set_prompt <текст>")
             return
-        self.messenger.set_system_prompt(new_prompt)
-        # Очистить историю при изменении промпта
+
+        self.messenger.set_system_prompt(new_prompt)  # локально (на всякий)
+        await save_chat_config(chat_id, system_prompt=new_prompt)
+        await clear_history(chat_id)  # чистим историю в БД
+
+        # Обновить кэш в памяти
         context.chat_data["history"] = []
         await update.message.reply_text("Системный промпт обновлён. История сообщений очищена.")
 
     async def get_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
         bot_username = context.bot_data.get("bot_username", "bot")
-        prompt = self.messenger.get_current_system_prompt(bot_username)
+
+        cfg = await load_chat_config(chat_id) or {}
+        prompt = cfg.get("system_prompt")
+        if not prompt:
+            prompt = self.messenger.get_current_system_prompt(bot_username)
         await update.message.reply_text(prompt)
 
     async def reset_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
         self.messenger.set_system_prompt(None)
-        # Очистить историю при сбросе промпта
+        await save_chat_config(chat_id, system_prompt=None)
+        await clear_history(chat_id)
+
         context.chat_data["history"] = []
         await update.message.reply_text("Промпт сброшен. История сообщений очищена.")
 
     async def clear_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+        await clear_history(chat_id)
         context.chat_data["history"] = []
         await update.message.reply_text("История сообщений очищена.")
 
     async def mute(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
         if not context.args:
             await update.message.reply_text("Укажите длительность в минутах: /mute <минуты>")
             return
@@ -79,17 +95,22 @@ class BotCommands:
         except ValueError:
             await update.message.reply_text("Некорректное число. Укажите положительное целое.")
             return
+
         until = datetime.utcnow() + timedelta(minutes=minutes)
+        await save_chat_config(chat_id, muted_until=until)
         context.chat_data["muted_until"] = until
         await update.message.reply_text(
             f"Бот замьючен на {minutes} мин. До {until.strftime('%H:%M:%S %d.%m.%Y UTC')}"
         )
 
     async def unmute(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+        await save_chat_config(chat_id, muted_until=None)
         context.chat_data.pop("muted_until", None)
         await update.message.reply_text("Бот размьючен.")
 
     async def set_history_limit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
         if not context.args:
             await update.message.reply_text("Укажите число: /set_history_limit <число>")
             return
@@ -100,14 +121,15 @@ class BotCommands:
         except ValueError:
             await update.message.reply_text("Некорректное число. Укажите положительное целое.")
             return
-        context.chat_data["history_limit"] = limit
-        # Подрезать текущую историю, если надо
-        history = context.chat_data.get("history", [])
-        if len(history) > limit:
-            history[:] = history[-limit:]
+
+        await save_chat_config(chat_id, history_limit=limit)
+        # Подрежем историю мгновенно (перечитка при следующем ответе тоже ок)
+        hist = await load_history(chat_id, limit)
+        context.chat_data["history"] = hist
         await update.message.reply_text(f"Лимит истории установлен: {limit}")
 
     async def set_autopost_interval(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
         if not context.args:
             await update.message.reply_text("Укажите число секунд: /set_autopost_interval <сек>")
             return
@@ -118,8 +140,11 @@ class BotCommands:
         except ValueError:
             await update.message.reply_text("Некорректное число. Укажите положительное целое.")
             return
+
+        await save_chat_config(chat_id, autopost_interval=interval)
         context.chat_data["autopost_interval"] = interval
-        if context.chat_data.get("autopost_enabled"):
+
+        if context.chat_data.get("autopost_enabled", True):
             # Перезапустить задачу
             job = context.chat_data.get("background_job")
             if job is not None:
@@ -132,13 +157,16 @@ class BotCommands:
                 self.messenger.check_scheduled,
                 interval=interval,
                 first=interval,
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
             )
             context.chat_data["background_job"] = job
         await update.message.reply_text(f"Интервал автосообщений: {interval} сек")
 
     async def enable_autopost(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+        await save_chat_config(chat_id, autopost_enabled=True)
         context.chat_data["autopost_enabled"] = True
+
         interval = context.chat_data.get("autopost_interval", 3600)
         job = context.chat_data.get("background_job")
         if job is None:
@@ -146,13 +174,16 @@ class BotCommands:
                 self.messenger.check_scheduled,
                 interval=interval,
                 first=interval,
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
             )
             context.chat_data["background_job"] = job
         await update.message.reply_text("Автосообщения включены.")
 
     async def disable_autopost(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+        await save_chat_config(chat_id, autopost_enabled=False)
         context.chat_data["autopost_enabled"] = False
+
         job = context.chat_data.get("background_job")
         if job is not None:
             try:
@@ -163,23 +194,32 @@ class BotCommands:
         await update.message.reply_text("Автосообщения выключены.")
 
     async def enable_reactions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+        await save_chat_config(chat_id, reactions_enabled=True)
         context.chat_data["reactions_enabled"] = True
         await update.message.reply_text("Реакции включены.")
 
     async def disable_reactions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+        await save_chat_config(chat_id, reactions_enabled=False)
         context.chat_data["reactions_enabled"] = False
         await update.message.reply_text("Реакции выключены.")
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
         bot_username = context.bot_data.get("bot_username", "bot")
-        prompt = self.messenger.get_current_system_prompt(bot_username)
-        is_custom = self.messenger.system_prompt_override is not None
-        history = context.chat_data.get("history", [])
-        history_limit = context.chat_data.get("history_limit", getattr(self.messenger, "MAX_HISTORY", 50))
-        autopost_enabled = bool(context.chat_data.get("autopost_enabled", True))
-        autopost_interval = context.chat_data.get("autopost_interval", 3600)
-        reactions_enabled = bool(context.chat_data.get("reactions_enabled", True))
-        muted_until = context.chat_data.get("muted_until")
+
+        cfg = await load_chat_config(chat_id) or {}
+        prompt = cfg.get("system_prompt") or self.messenger.get_current_system_prompt(bot_username)
+        is_custom = cfg.get("system_prompt") is not None
+
+        history_limit = int(cfg.get("history_limit", getattr(self.messenger, "MAX_HISTORY", 50)))
+        history = await load_history(chat_id, history_limit)
+
+        autopost_enabled = bool(cfg.get("autopost_enabled", True))
+        autopost_interval = int(cfg.get("autopost_interval", 3600))
+        reactions_enabled = bool(cfg.get("reactions_enabled", True))
+        muted_until = cfg.get("muted_until")
         now = datetime.utcnow()
         muted_str = (
             f"до {muted_until.strftime('%H:%M:%S %d.%m.%Y UTC')}"
@@ -196,6 +236,7 @@ class BotCommands:
         await update.message.reply_text("\n".join(parts))
 
     async def metrics(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Метрики хранятся в chat_data['scoring'] и периодически синкаются в БД (см. message.py).
         scoring = context.chat_data.get("scoring", {})
         message_counter = scoring.get("message_counter", 0)
         user_streaks = scoring.get("user_streaks", {})
@@ -238,7 +279,7 @@ class BotCommands:
         today = datetime.utcnow().date()
         holidays = HolidayEvaluator().evaluate()
         if not holidays:
-            await update.message.reply_text(f"Сегодня {today.strftime('%d.%m.%Y')} праздников нет.")
+            await update.message.reply_text(f"Сегодня {today.strftime('%d.%м.%Y')} праздников нет.")
             return
         bot_username = context.bot_data.get("bot_username", "bot")
         holiday_names = ", ".join(holidays)
@@ -256,5 +297,3 @@ class BotCommands:
     # Utility used by Messenger for mention-based help
     async def handle_mention_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.help(update, context)
-
-
