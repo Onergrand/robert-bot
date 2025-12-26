@@ -1,5 +1,7 @@
 import os
 import logging
+# from telegram.ext._contexttypes import DEFAULT_TYPE
+from typing import Any
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -13,6 +15,8 @@ from telegram.ext import (
 from message import Messenger
 from bot_commands import BotCommands
 from db.db import healthcheck  # NEW
+from db.chat_repo import ensure_user, set_user_role, get_user_role
+from db.migrations import run_migrations  # Миграции БД
 
 # Загрузка переменных из .env
 load_dotenv()
@@ -53,6 +57,39 @@ async def post_init(application):
         logging.exception("DB connection failed")
         # Можно падать сразу:
         # raise
+    
+    # Выполняем миграции (создание таблиц если их нет)
+    try:
+        await run_migrations()
+        logging.info("Migrations completed")
+    except Exception:
+        logging.exception("Migration failed")
+        # Продолжаем работу, но могут быть проблемы
+    
+    # Инициализация первого owner из переменной окружения
+    owner_id_str = os.getenv("OWNER_ID")
+    if owner_id_str:
+        try:
+            owner_id = int(owner_id_str)
+            current_role = await get_user_role(owner_id)
+            if current_role != "owner":
+                await set_user_role(owner_id, None, "owner")
+                logging.info(f"Owner initialized: {owner_id}")
+            else:
+                logging.info(f"Owner already exists: {owner_id}")
+        except (ValueError, Exception) as e:
+            logging.warning(f"Failed to initialize owner from OWNER_ID: {e}")
+
+    # Создаём глобальную задачу для отправки праздничных сообщений во все чаты
+    # Запускается каждый день в 10:00 UTC (можно изменить время)
+    from datetime import time
+    job_queue = application.job_queue
+    job_queue.run_daily(
+        messenger.send_holiday_congrats,
+        time=time(hour=5, minute=35),  # 10:00 UTC каждый день
+        name="holiday_congrats_all_chats"
+    )
+    logging.info("Global holiday message job scheduled (daily at 10:00 UTC)")
 
 
 # Обёртки, чтобы дергать методы BotCommands из bot_data
@@ -120,12 +157,32 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot_data["commands"].unmute(update, context)
 
+async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot_data["commands"].say(update, context)
+
+async def cmd_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot_data["commands"].add_admin(update, context)
+
+async def cmd_remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot_data["commands"].remove_admin(update, context)
+
+async def cmd_list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot_data["commands"].list_admins(update, context)
+
+async def cmd_set_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot_data["commands"].set_owner(update, context)
 
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN must be set")
 
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    # Увеличенные таймауты для избежания проблем с соединением
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN)\
+        .connect_timeout(60)\
+        .read_timeout(60)\
+        .write_timeout(60)\
+        .pool_timeout(60)\
+        .post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", cmd_help))
@@ -145,8 +202,14 @@ def main():
     application.add_handler(CommandHandler("clear_history", cmd_clear_history))
     application.add_handler(CommandHandler("mute", cmd_mute))
     application.add_handler(CommandHandler("unmute", cmd_unmute))
+    application.add_handler(CommandHandler("say", cmd_say))
+    application.add_handler(CommandHandler("add_admin", cmd_add_admin))
+    application.add_handler(CommandHandler("remove_admin", cmd_remove_admin))
+    application.add_handler(CommandHandler("list_admins", cmd_list_admins))
+    application.add_handler(CommandHandler("set_owner", cmd_set_owner)) 
+    
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+    
     logging.info("Бот запущен...")
     application.run_polling()
 
