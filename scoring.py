@@ -103,7 +103,7 @@ class Scorer:
 4. Есть ли в сообщении что-то интересное, на что стоит отреагировать?
 Темы интересные для бота - СВО, Украина, Имена и прозвища(Артем, Никон, Никонов, Андрей, Матвей, 
 Усков, Тимоха, ботинок, старый, Савва, Савелий, шишка, швецов, АШ, Илю, Илья, Ведегава, Веденеев), 
-план 28, аниме, туалеты, сглыпа, игры, вар тандер 
+план 28, аниме, туалеты, сглыпа, игры, вар тандер, данила, кэн, кожемяк, кожемяка, даня, письки
 
 Ответь в формате JSON:
 {
@@ -120,7 +120,7 @@ class Scorer:
         messages = [{"role": "system", "content": system_prompt}]
         if context:
             # Берем последние 5 сообщений для контекста
-            messages.extend(context[-5:])
+            messages.extend(context[-15:])
         messages.append({"role": "user", "content": user_prompt})
 
         # Пробуем сначала reasoning модель, если не работает - fallback на обычную
@@ -194,6 +194,7 @@ class Scorer:
           - mode: 'immediate', 'delayed', 'laughter', 'context_check'
           - delay: int (секунды) для режима 'delayed'
         """
+        chat = update.effective_chat
         msg = update.message
         msg_id = msg.message_id
         user_id = msg.from_user.id
@@ -207,6 +208,14 @@ class Scorer:
         self.record_reply(update)
         streak = self.update_user_streak(update)
         count = self.increment_message_counter()
+
+        if chat.type == 'private':
+                    logging.info(f"[SCORING] Private chat detected (ID: {chat.id}), responding always.")
+                    return {
+                        'respond': True, 
+                        'mode': 'immediate', 
+                        'reason': 'private_chat'
+                    }
 
         # 3) Если уже отвечали на это сообщение — пропускаем
         if msg_id in self.responded:

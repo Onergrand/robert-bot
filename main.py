@@ -86,7 +86,7 @@ async def post_init(application):
     job_queue = application.job_queue
     job_queue.run_daily(
         messenger.send_holiday_congrats,
-        time=time(hour=5, minute=35),  # 10:00 UTC каждый день
+        time=time(hour=11, minute=30),  # 10:00 UTC каждый день
         name="holiday_congrats_all_chats"
     )
     logging.info("Global holiday message job scheduled (daily at 10:00 UTC)")
@@ -172,6 +172,17 @@ async def cmd_list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_set_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot_data["commands"].set_owner(update, context)
 
+# Добавьте это в main.py
+async def cmd_list_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot_data["commands"].list_chats(update, context)
+
+async def cmd_get_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot_data["commands"].get_history(update, context)
+
+async def cmd_generate_to_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Обратите внимание: в bot_commands.py вы назвали метод gen_to_chat
+    await context.bot_data["commands"].generate_to_chat(update, context)
+
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN must be set")
@@ -207,6 +218,9 @@ def main():
     application.add_handler(CommandHandler("remove_admin", cmd_remove_admin))
     application.add_handler(CommandHandler("list_admins", cmd_list_admins))
     application.add_handler(CommandHandler("set_owner", cmd_set_owner)) 
+    application.add_handler(CommandHandler("list_chats", cmd_list_chats))
+    application.add_handler(CommandHandler("get_history", cmd_get_history))
+    application.add_handler(CommandHandler("generate_to_chat", cmd_generate_to_chat))
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     

@@ -14,6 +14,12 @@ from db.chat_repo import (
 )
 from db.permissions import check_permission, is_owner, is_admin
 
+from message import Messenger
+
+from db.chat_repo import get_all_chat_ids, load_history, get_user_role, append_message
+from telegram import Update
+from telegram.ext import ContextTypes
+import logging
 
 class BotCommands:
     """Команды управления ботом, теперь с сохранением настроек в БД."""
@@ -109,6 +115,7 @@ class BotCommands:
             
             # Получим лимит истории для этого чата. MAX_HISTORY по умолчанию 50 (из message.py)
             cfg = await load_chat_config(target_chat_id) or {}
+            await append_message(target_chat_id, "assistant", text_to_send)
             limit = int(cfg.get("history_limit", 50)) 
             
             # await append_message(target_chat_id, "assistant", text_to_send, limit)
@@ -326,6 +333,86 @@ class BotCommands:
             f"Мьют: {muted_str}",
         ]
         await update.message.reply_text("\n".join(parts))
+
+    async def list_chats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await is_owner(update, context): return
+        
+        chat_ids = await get_all_chat_ids()
+        if not chat_ids:
+            await update.message.reply_text("Бот пока не состоит ни в одном чате.")
+            return
+        
+        response = "<b>Список чатов:</b>\n"
+        for cid in chat_ids:
+            try:
+                chat = await context.bot.get_chat(cid)
+                response += f"• {chat.title or 'Private'} (<code>{cid}</code>) [{chat.type}]\n"
+            except Exception:
+                response += f"• Неизвестный чат (<code>{cid}</code>)\n"
+        
+        await update.message.reply_text(response, parse_mode="HTML")
+
+    # --- КОМАНДА 2: История сообщений чата ---
+    async def get_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await is_owner(update, context): return
+        
+        if not context.args:
+            await update.message.reply_text("Используйте: /get_history <chat_id>")
+            return
+        
+        try:
+            target_chat_id = int(context.args[0])
+            history = await load_history(target_chat_id, limit=20) # берем последние 20
+            
+            if not history:
+                await update.message.reply_text(f"История для чата {target_chat_id} пуста.")
+                return
+                
+            text = f"<b>Последние сообщения в {target_chat_id}:</b>\n\n"
+            for msg in history:
+                role = "🤖" if msg['role'] == "assistant" else "👤"
+                content = msg['content'][:100] + "..." if len(msg['content']) > 100 else msg['content']
+                text += f"{role} <code>{content}</code>\n\n"
+                
+            await update.message.reply_text(text, parse_mode="HTML")
+        except ValueError:
+            await update.message.reply_text("ID чата должен быть числом.")
+
+    # --- КОМАНДА 3: Генерация сообщения в чат ---
+    async def generate_to_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await is_owner(update, context): return
+        
+        # Формат: /gen <chat_id> <тема/промпт>
+        if len(context.args) < 2:
+            await update.message.reply_text("Используйте: /gen <chat_id> <тема или доп. промпт>")
+            return
+        
+        try:
+            target_chat_id = int(context.args[0])
+            user_prompt = " ".join(context.args[1:])
+            
+            messenger: Messenger = context.bot_data["messenger"]
+            
+            # Получаем историю чата для контекста
+            history = await load_history(target_chat_id)
+            
+            # Генерируем ответ через DeepSeek (используя метод из Messenger)
+            # Мы немного "хитрим" и просим бота выдать ответ на базе темы
+            system_prompt = messenger._default_system_prompt(context.bot_data.get("bot_username", "Robert"))
+            system_prompt += f"\n\nДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ: Напиши сообщение в чат на тему: {user_prompt}"
+            
+        
+            ai_response = messenger._call_deepseek(history, system_prompt, target_chat_id)
+            
+            if ai_response:
+                await context.bot.send_message(chat_id=target_chat_id, text=ai_response)
+                await append_message(target_chat_id, "assistant", ai_response)
+                await update.message.reply_text(f"✅ Сообщение отправлено в чат {target_chat_id}")
+            else:
+                await update.message.reply_text("❌ Не удалось сгенерировать ответ.")
+                
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка: {e}")
 
     async def metrics(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Метрики хранятся в chat_data['scoring'] и периодически синкаются в БД (см. message.py).

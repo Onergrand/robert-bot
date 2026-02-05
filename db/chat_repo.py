@@ -1,6 +1,7 @@
 # chat_repo.py
 from typing import Optional, List, Dict, Any
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_session
 from db.db import get_session
 import json
 
@@ -16,6 +17,11 @@ async def ensure_chat(chat_id: int, chat_type: str, title: Optional[str]):
             ON CONFLICT (chat_id) DO NOTHING
         """), {"cid": chat_id, "ctype": chat_type, "title": title})
         await s.commit()
+
+async def get_all_chat_ids():
+    async with get_session() as s: # Используем правильную функцию получения сессии
+        res = await s.execute(text("SELECT chat_id FROM chats"))
+        return [row[0] for row in res.fetchall()]
 
 async def load_chat_config(chat_id: int) -> Dict[str, Any]:
     async with get_session() as s:
